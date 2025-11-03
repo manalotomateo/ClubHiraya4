@@ -1,67 +1,91 @@
 <?php
-// api/create_order.php
-// Accepts JSON { items: [{id, qty, price?}], discount?, note?, idempotency_key?, currency?, exchange_rate? }
-// Returns { success:true, order_id, already_exists:false } or error
+// complete_order.php
+// Expects: POST JSON { order_id, payments: [{method, amount, reference}], finalize_note(optional) }
+// Returns JSON { success:true, order_id, sales_id }
+
 header('Content-Type: application/json; charset=utf-8');
-require_once __DIR__ . '/db.php'; // expect $pdo
+require_once __DIR__ . '/db.php'; // expects $conn (mysqli)
 
-$raw = file_get_contents('php://input');
-$data = json_decode($raw, true);
-if (!is_array($data) || empty($data['items'])) {
+$input = json_decode(file_get_contents('php://input'), true);
+if (!$input || !isset($input['order_id']) || !isset($input['payments'])) {
     http_response_code(400);
-    echo json_encode(['success' => false, 'error' => 'Invalid payload (items required)']);
+    echo json_encode(['success'=>false,'error'=>'Invalid payload']);
     exit;
 }
 
-$items = $data['items'];
-$note = isset($data['note']) ? trim($data['note']) : '';
-$discount = isset($data['discount']) ? floatval($data['discount']) : 0.0;
-$idempotency = isset($data['idempotency_key']) ? trim($data['idempotency_key']) : '';
-$currency = isset($data['currency']) ? trim($data['currency']) : 'PHP';
-$exchange_rate = isset($data['exchange_rate']) ? $data['exchange_rate'] : null; // expect array like ['code'=>'USD','rate'=>0.017]
+$order_id = intval($input['order_id']);
+$payments = $input['payments'];
 
-// idempotency: return existing order_id if the same key exists
 try {
-    if ($idempotency !== '') {
-        $stmt = $pdo->prepare('SELECT id FROM orders WHERE idempotency_key = :k LIMIT 1');
-        $stmt->execute([':k' => $idempotency]);
-        $row = $stmt->fetch(PDO::FETCH_ASSOC);
-        if ($row && isset($row['id'])) {
-            echo json_encode(['success' => true, 'order_id' => (int)$row['id'], 'already_exists' => true]);
-            exit;
-        }
+    $conn->begin_transaction();
+
+    // Lock order
+    $stmt = $conn->prepare("SELECT status, discount, currency, exchange_rate FROM orders WHERE id = ? FOR UPDATE");
+    $stmt->bind_param('i', $order_id);
+    $stmt->execute();
+    $stmt->bind_result($status, $discount, $currency, $exchange_rate);
+    if (!$stmt->fetch()) throw new Exception('Order not found');
+    $stmt->close();
+    if ($status === 'completed') {
+        $conn->commit();
+        echo json_encode(['success'=>true,'order_id'=>$order_id,'already_completed'=>true]);
+        exit;
     }
 
-    $pdo->beginTransaction();
+    // Sum order total from items
+    $stmt = $conn->prepare("SELECT SUM(qty * price) as subtotal FROM order_items WHERE order_id = ?");
+    $stmt->bind_param('i', $order_id);
+    $stmt->execute();
+    $stmt->bind_result($subtotal);
+    $stmt->fetch();
+    $stmt->close();
+    $subtotal = floatval($subtotal);
+    $discount = floatval($discount);
+    $total = max(0, $subtotal - $discount);
 
-    $stmt = $pdo->prepare('INSERT INTO orders (idempotency_key, currency, exchange_rate, discount, note, status, created_at) VALUES (:k, :currency, :exchange_rate, :discount, :note, :status, NOW())');
-    $stmt->execute([
-        ':k' => $idempotency ?: null,
-        ':currency' => $currency,
-        ':exchange_rate' => $exchange_rate ? json_encode($exchange_rate, JSON_UNESCAPED_UNICODE) : null,
-        ':discount' => $discount,
-        ':note' => $note,
-        ':status' => 'pending'
-    ]);
-    $orderId = (int)$pdo->lastInsertId();
-
-    $insertItem = $pdo->prepare('INSERT INTO order_items (order_id, food_id, qty, unit_price) VALUES (:order_id, :food_id, :qty, :unit_price)');
-    foreach ($items as $it) {
-        $fid = isset($it['id']) ? (int)$it['id'] : 0;
-        $qty = isset($it['qty']) ? (int)$it['qty'] : 0;
-        $unitPrice = isset($it['price']) ? floatval($it['price']) : 0.0; // price in PHP captured at order time
-        if ($fid <= 0 || $qty <= 0) continue;
-        $insertItem->execute([':order_id' => $orderId, ':food_id' => $fid, ':qty' => $qty, ':unit_price' => $unitPrice]);
+    // Record payments rows
+    $ins = $conn->prepare("INSERT INTO payments (order_id, method, amount, reference, created_at) VALUES (?, ?, ?, ?, NOW())");
+    foreach ($payments as $p) {
+        $method = $conn->real_escape_string($p['method']);
+        $amount = floatval($p['amount']);
+        $reference = isset($p['reference']) ? $conn->real_escape_string($p['reference']) : '';
+        $ins->bind_param('isds', $order_id, $method, $amount, $reference);
+        if (!$ins->execute()) throw new Exception('Insert payment failed: ' . $ins->error);
     }
+    $ins->close();
 
-    $pdo->commit();
+    // Update inventory: simple decrement based on order_items (assuming inventory.product_id exists)
+    $stmt = $conn->prepare("SELECT product_id, qty FROM order_items WHERE order_id = ?");
+    $stmt->bind_param('i', $order_id);
+    $stmt->execute();
+    $stmt->bind_result($product_id, $qty);
+    $updInv = $conn->prepare("UPDATE inventory SET stock = stock - ? WHERE product_id = ?");
+    while ($stmt->fetch()) {
+        $updInv->bind_param('ii', $qty, $product_id);
+        $updInv->execute(); // ignore errors here; inventory integrity checks should be added later
+    }
+    $stmt->close();
+    $updInv->close();
 
-    echo json_encode(['success' => true, 'order_id' => $orderId, 'already_exists' => false]);
-    exit;
+    // Mark order completed
+    $stmt = $conn->prepare("UPDATE orders SET status = 'completed', completed_at = NOW() WHERE id = ?");
+    $stmt->bind_param('i', $order_id);
+    if (!$stmt->execute()) throw new Exception('Mark order failed: ' . $stmt->error);
+    $stmt->close();
+
+    // Insert into sales (simple aggregated)
+    $stmt = $conn->prepare("INSERT INTO sales (order_id, subtotal, discount, total, currency, exchange_rate, created_at) VALUES (?, ?, ?, ?, ?, ?, NOW())");
+    $stmt->bind_param('idds', $order_id, $subtotal, $discount, $total, $currency); // adjust datatypes
+    // Because bind_param types require specific types, do a simple execute via escaping for currency/exchange_rate:
+    $currency_esc = $conn->real_escape_string($currency);
+    $exchange_rate = floatval($exchange_rate);
+    $query = "INSERT INTO sales (order_id, subtotal, discount, total, currency, exchange_rate, created_at) VALUES ($order_id, $subtotal, $discount, $total, '$currency_esc', $exchange_rate, NOW())";
+    if (!$conn->query($query)) throw new Exception('Insert sales failed: ' . $conn->error);
+
+    $conn->commit();
+    echo json_encode(['success'=>true, 'order_id'=>$order_id]);
 } catch (Exception $e) {
-    if ($pdo && $pdo->inTransaction()) $pdo->rollBack();
+    $conn->rollback();
     http_response_code(500);
-    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
-    exit;
-}
-?>
+    echo json_encode(['success'=>false,'error'=>$e->getMessage()]);
+}x

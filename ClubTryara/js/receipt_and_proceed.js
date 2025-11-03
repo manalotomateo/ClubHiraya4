@@ -1,145 +1,139 @@
-// Robust Bill Out and Proceed helpers.
-// Include this <script src="js/receipt_and_proceed.js"></script> after your main app.js
-(function () {
-  // Use the global 'order' variable created by your app.js.
-  // If your app stores the cart in a different variable, update getCart() accordingly.
-  function getCart() {
-    if (typeof order !== 'undefined' && Array.isArray(order)) return order;
-    // fallback: attempt to read from a global window.cart
-    if (typeof window.cart !== 'undefined' && Array.isArray(window.cart)) return window.cart;
-    return [];
+// receipt_and_proceed.js
+// Full client-side helper for creating orders (idempotent), opening receipt windows,
+// coordinating finalize between receipt and POS opener, and calling the finalize API.
+//
+// Usage notes:
+// - Your main app should provide gatherCurrentOrder() that returns:
+//   { items: [{product_id, qty, price}], discount, note, currency, exchange_rate, table_id }
+// - Optional UI hooks your app can implement:
+//   - window.onOrderFinalized(orderId)  -> called when order finalized
+//   - window.showProceedForOrder(orderId) -> called when receipt didn't finalize and user should proceed in POS
+// - The script expects API endpoints at /ClubTryara/api/create_order.php and /ClubTryara/api/complete_order.php
+
+(function (global) {
+  const API_BASE = '/ClubTryara/api/';
+
+  function log() {
+    if (window.console && console.log) console.log.apply(console, arguments);
   }
 
-  function getTotals() {
-    // If your app exposes a computeNumbers() helper that returns totals, use it.
-    if (typeof computeNumbers === 'function') {
-      try { return computeNumbers(); } catch (e) { /* ignore */ }
-    }
-    // fallback empty totals
-    return { subtotal: 0, serviceCharge: 0, tax: 0, discountAmount: 0, payable: 0 };
-  }
-
-  // Robust Bill Out: open new window first, then POST cart/totals to print_receipt.php with that target
-  async function handleBillOut() {
-    const cart = getCart();
-    if (!cart || cart.length === 0) {
-      alert('Cart is empty.');
-      return;
-    }
-
-    // open a blank window first so popup blockers can be detected
-    const w = window.open('', '_blank', 'width=820,height=920,menubar=no,toolbar=no,location=no,status=no');
-    if (!w) {
-      alert('Popup blocked. Please allow popups for this site to print receipts.');
-      return;
-    }
-
-    // build form, attach to document, submit to new window
-    const form = document.createElement('form');
-    form.method = 'POST';
-    // Adjust path if your print_receipt.php is in a different folder
-    form.action = 'php/print_receipt.php';
-    form.target = w.name;
-
-    const inputCart = document.createElement('input');
-    inputCart.type = 'hidden';
-    inputCart.name = 'cart';
-    inputCart.value = JSON.stringify(cart);
-    form.appendChild(inputCart);
-
-    const inputTotals = document.createElement('input');
-    inputTotals.type = 'hidden';
-    inputTotals.name = 'totals';
-    inputTotals.value = JSON.stringify(getTotals());
-    form.appendChild(inputTotals);
-
-    document.body.appendChild(form);
-    form.submit();
-    document.body.removeChild(form);
-
-    try { w.focus(); } catch (e) { /* ignore focus errors */ }
-  }
-
-  // Proceed: separate operation — calls API to update stock in DB
-  // Expects an endpoint at api/update_stock.php that accepts JSON { items: [{id, qty}, ...] }
-  async function handleProceed() {
-    const cart = getCart();
-    if (!cart || cart.length === 0) {
-      alert('No items to proceed.');
-      return;
-    }
-
-    if (!confirm('Proceed with this order and update stock?')) return;
-
-    // disable proceed button if present
-    const proceedBtn = document.getElementById('proceedBtn') || document.querySelector('.proceed-btn');
-    const billOutBtn = document.getElementById('billOutBtn') || document.querySelector('.hold-btn');
-
-    if (proceedBtn) proceedBtn.disabled = true;
-    if (billOutBtn) billOutBtn.disabled = true;
-
+  async function apiPost(path, body) {
+    const url = API_BASE + path;
     try {
-      // prepare payload
-      const items = cart.map(i => ({ id: i.id, qty: i.qty }));
-      const res = await fetch('api/update_stock.php', {
+      const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items })
+        body: JSON.stringify(body)
       });
-
-      if (!res.ok) {
-        throw new Error('Network response was not OK: ' + res.status);
-      }
-
-      const body = await res.json();
-      if (body.success) {
-        alert('Stock updated successfully.');
-        // Optionally refresh product list/UI. If your app has a reload function, call it:
-        if (typeof loadProducts === 'function') {
-          await loadProducts();
-        } else {
-          location.reload(); // fallback if no JS refresh helper
-        }
-      } else {
-        const msg = body.message || (body.errors ? body.errors.join('\n') : 'Unknown error');
-        alert('Failed to update stock: ' + msg);
-      }
+      const j = await res.json();
+      return j;
     } catch (err) {
-      console.error(err);
-      alert('Error while updating stock: ' + (err.message || err));
-    } finally {
-      if (proceedBtn) proceedBtn.disabled = false;
-      if (billOutBtn) billOutBtn.disabled = false;
+      log('API error', path, err);
+      return { success: false, error: err.message || 'Network error' };
     }
   }
 
-  // Wire up buttons if present on the page
-  document.addEventListener('DOMContentLoaded', function () {
-    const billOutBtn = document.getElementById('billOutBtn') || document.querySelector('.hold-btn');
-    const proceedBtn = document.getElementById('proceedBtn') || document.querySelector('.proceed-btn');
+  function generateIdempotencyKey() {
+    // ISO-like timestamp + random suffix ensures practical uniqueness
+    return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+  }
 
-    if (billOutBtn) {
-      // Remove old handlers to avoid double-binding (defensive)
-      billOutBtn.replaceWith(billOutBtn.cloneNode(true));
-      const newBillBtn = document.getElementById('billOutBtn') || document.querySelector('.hold-btn');
-      newBillBtn.addEventListener('click', function (e) {
-        e.preventDefault();
-        handleBillOut();
-      });
+  // Create order (idempotent) and open receipt window
+  async function createAndShowReceipt(orderPayload, openInNewWindow = true) {
+    if (!orderPayload || !Array.isArray(orderPayload.items) || orderPayload.items.length === 0) {
+      throw new Error('Invalid order payload');
     }
 
-    if (proceedBtn) {
-      proceedBtn.replaceWith(proceedBtn.cloneNode(true));
-      const newProceedBtn = document.getElementById('proceedBtn') || document.querySelector('.proceed-btn');
-      newProceedBtn.addEventListener('click', function (e) {
-        e.preventDefault();
-        handleProceed();
-      });
-    }
-  });
+    // attach an idempotency key so retries won't create duplicates
+    const idempotencyKey = generateIdempotencyKey();
+    orderPayload.idempotency_key = idempotencyKey;
 
-  // Expose functions for debugging if needed
-  window._club_tryara = window._club_tryara || {};
-  window._club_tryara.handleBillOut = handleBillOut;
-  window._club_tryara.handleProceed = handleProceed;
-})();
+    const created = await apiPost('create_order.php', orderPayload);
+    if (!created || !created.success) {
+      throw new Error(created && created.error ? created.error : 'Failed creating order');
+    }
+
+    const orderId = created.order_id;
+    const receiptUrl = `/ClubTryara/php/print_receipt.php?order_id=${encodeURIComponent(orderId)}`;
+
+    // Open receipt window/tab
+    let receiptWin = null;
+    try {
+      receiptWin = window.open(receiptUrl, 'receipt_' + orderId, 'width=420,height=720');
+    } catch (e) {
+      // fallback: navigate current window (not ideal)
+      receiptWin = window.open(receiptUrl, '_blank');
+    }
+
+    // Setup listening for finalize message from receipt window
+    let finalized = false;
+    function onMessage(e) {
+      if (!e || !e.data) return;
+      const data = e.data;
+      if (data && data.type === 'order_finalized' && parseInt(data.order_id, 10) === parseInt(orderId, 10)) {
+        finalized = true;
+        window.removeEventListener('message', onMessage);
+        if (receiptWin && !receiptWin.closed) {
+          try { receiptWin.close(); } catch (err) { /* ignore */ }
+        }
+        // notify host app
+        if (typeof window.onOrderFinalized === 'function') {
+          try { window.onOrderFinalized(orderId); } catch (err) { log('onOrderFinalized error', err); }
+        }
+      }
+    }
+    window.addEventListener('message', onMessage);
+
+    // Setup fallback: if receipt doesn't finalize within timeout, call host UI to show proceed control
+    const fallbackMs = 30000; // 30 seconds
+    setTimeout(() => {
+      if (!finalized) {
+        if (typeof window.showProceedForOrder === 'function') {
+          try { window.showProceedForOrder(orderId); } catch (err) { log('showProceedForOrder error', err); }
+        } else {
+          // default: alert
+          alert('Receipt not finalized. Please use Proceed to complete payment.');
+        }
+      }
+    }, fallbackMs);
+
+    return { success: true, order_id: orderId, already_created: !!created.already_created };
+  }
+
+  // Finalize order by calling API complete_order.php
+  // payments: [{method: 'Cash', amount: 100, reference: ''}, ...]
+  async function finalizeOrder(orderId, payments) {
+    if (!orderId) throw new Error('orderId required');
+    if (!Array.isArray(payments) || payments.length === 0) {
+      throw new Error('payments required (array of {method, amount, reference})');
+    }
+
+    const payload = { order_id: orderId, payments: payments };
+    const res = await apiPost('complete_order.php', payload);
+    if (!res || !res.success) {
+      throw new Error(res && res.error ? res.error : 'Failed to finalize order');
+    }
+
+    // Notify other windows (receipt/opener)
+    try {
+      window.postMessage({ type: 'order_finalized', order_id: orderId }, '*');
+    } catch (err) {
+      log('postMessage error', err);
+    }
+
+    // Notify host app
+    if (typeof window.onOrderFinalized === 'function') {
+      try { window.onOrderFinalized(orderId); } catch (err) { log('onOrderFinalized error', err); }
+    }
+
+    return { success: true, order_id: orderId };
+  }
+
+  // Expose API to global
+  global.ClubTryara = global.ClubTryara || {};
+  global.ClubTryara.createAndShowReceipt = createAndShowReceipt;
+  global.ClubTryara.finalizeOrder = finalizeOrder;
+  global.ClubTryara.apiPost = apiPost;
+  global.ClubTryara.generateIdempotencyKey = generateIdempotencyKey;
+
+})(window);
